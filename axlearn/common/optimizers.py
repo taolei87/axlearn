@@ -1192,6 +1192,7 @@ def skip_and_clip_by_global_norm(
     *,
     drop_norm: Optional[Union[float, ConfigOr[DropNormThresholdFn]]] = None,
     max_norm: Optional[float] = None,
+    entrywise_clipping_threshold: Optional[float] = None,
     grad_norm_ema_decay: Optional[float] = None,
     eps: float = 1e-8,
 ) -> PartitionedGradientTransformation:
@@ -1230,6 +1231,7 @@ def skip_and_clip_by_global_norm(
             based on recent gradient stats.
         max_norm: the maximum global gradient norm. If this is set, larger gradients will be scaled
             and clipped.
+        entrywise_clipping_threshold: If not None, also apply entrywise clipping to gradients.
         gradient_norm_ema_decay: the decay factor used to compute EMA of gradient norms. This must
             be set when `drop_norm` is a DropNormThreholdFn.
         eps: a small constant added to scaling factor, i.e. `1/(norm + eps)`.
@@ -1320,6 +1322,14 @@ def skip_and_clip_by_global_norm(
                     )
                 return is_valid, new_drop_stats
 
+        def _entrywise_clip(updates: Tensor, rms: Tensor) -> Tensor:
+            """Clips the updates tensor entrywise."""
+            t = entrywise_clipping_threshold * rms
+            # Expand the shape of t from (num_layers, ) to (num_layers, 1, 1, ..) for broadcasting
+            expanded_shape = t.shape + (1,) * (len(updates.shape) - len(rms.shape))
+            t = jnp.reshape(t, expanded_shape)
+            return jnp.clip(updates, -t, t)
+
         # Check if every gradient is finite.
         flat_updates = jax.tree_util.tree_flatten(updates)[0]
         is_finite = jnp.all(jnp.array([jnp.all(jnp.isfinite(p)) for p in flat_updates]))
@@ -1385,6 +1395,14 @@ def skip_and_clip_by_global_norm(
             clipped_updates = jax.tree_util.tree_map(lambda t: t * g_scale, updates)
             if context is not None:
                 context.add_summary("gradient_scale", g_scale)
+        if entrywise_clipping_threshold is not None:
+            update_rms = _compute_rms_norms(clipped_updates)
+            clipped_updates = jax.tree_util.tree_map(
+                lambda u, r: _entrywise_clip(updates=u, rms=r),
+                clipped_updates,
+                update_rms,
+            )
+
         # Apply subsequent gradient transformation.
         new_updates, new_inner_state = inner.update(clipped_updates, inner_state, params)
         # Discard the updates and states in a nonvalid step.
@@ -1693,6 +1711,7 @@ def adastar_optimizer(
     eps: float,
     eps_square: float,
     raw_update_clipping_threshold: Optional[float],
+    entrywise_clipping_threshold: Optional[float] = None,
     update_ema_decay: Optional[float],
     update_ema_debias: bool,
     adam_update_transformation: Optional[ConfigOr[PartitionedGradientTransformation]] = None,
@@ -1758,6 +1777,7 @@ def adastar_optimizer(
         eps_square: (float) regularization constant added to gradient_squares.
         raw_update_clipping_threshold: If not None, clips the norms of the raw updates
             to this value. `raw_update_norm` summaries will be logged either way.
+        entrywise_clipping_threshold: If not None, clips every entry of the updates.
         update_ema_decay: If not None, applies momentum on raw updates (normalized gradients) to
             compute smoothed updates.
         update_ema_debias: Whether to apply bias correction when computing smoothed updates.
@@ -1883,6 +1903,14 @@ def adastar_optimizer(
             )
             return _AdastarUpdateResult(updates=smoothed_updates, pps=new_pps)
 
+        def _entrywise_clip(updates: Tensor, rms: Tensor, expected_rms: Tensor) -> Tensor:
+            """Clips the updates tensor entrywise."""
+            t = entrywise_clipping_threshold * jnp.minimum(rms, expected_rms)
+            # Expand the shape of t from (num_layers, ) to (num_layers, 1, 1, ..) for broadcasting
+            expanded_shape = t.shape + (1,) * (len(updates.shape) - len(rms.shape))
+            t = jnp.reshape(t, expanded_shape)
+            return jnp.clip(updates, -t, t)
+
         # First compute raw updates.
         raw_updates, pps_tree = _split_update_results(
             vectorized_tree_map(
@@ -1896,6 +1924,15 @@ def adastar_optimizer(
             raw_update_clipping_threshold, summary_suffix="raw_update_norm"
         ).update
         raw_updates, _ = clip_fn(raw_updates, None, params)
+
+        if entrywise_clipping_threshold is not None:
+            raw_update_rms = _compute_rms_norms(raw_updates)
+            raw_updates = jax.tree_util.tree_map(
+                lambda u, r: _entrywise_clip(updates=u, rms=r, expected_rms=1),
+                raw_updates,
+                raw_update_rms,
+            )
+
         # Compute smoothed updates.
         smoothed_updates, pps_tree = _split_update_results(
             vectorized_tree_map(
@@ -1904,6 +1941,17 @@ def adastar_optimizer(
                 pps_tree,
             )
         )
+
+        if entrywise_clipping_threshold is not None:
+            smoothed_update_rms = _compute_rms_norms(smoothed_updates)
+            b1 = update_ema_decay if update_ema_decay is not None else gradient_ema_decay
+            expected_rms = ((1 - b1) / (1 + b1)) ** 0.5
+            smoothed_updates = jax.tree_util.tree_map(
+                lambda u, r: _entrywise_clip(updates=u, rms=r, expected_rms=expected_rms),
+                smoothed_updates,
+                smoothed_update_rms,
+            )
+
         # Add param and update stats to summaries.
         _compute_rms_norms(grads, summary_suffix="raw_grad_norm")
         param_values = jax.tree_util.tree_map(lambda p: p.value, params)

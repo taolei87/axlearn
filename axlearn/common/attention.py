@@ -1562,6 +1562,10 @@ class MultiheadAttention(BaseLayer):
 
         # [batch, target_length, output_dim].
         o_proj = self.o_proj(context)
+        self.add_module_output(
+            "aux_loss",
+            jnp.mean(o_proj**2.0, dtype=jnp.float32) * 1e-6,
+        )
         outputs = self._remat_name(o_proj, "o_proj")
 
         cfg = self.config
@@ -2442,6 +2446,10 @@ class TransformerFeedForwardLayer(BaseLayer):
             x = self.linear2(x)
             if "linear2_outputs" in cfg.add_value_rms_norm_summary:
                 self._report_tensor_stats(x, "linear2_outputs")
+            self.add_module_output(
+                "aux_loss",
+                jnp.mean(x**2.0, dtype=jnp.float32) * 1e-6,
+            )
             return x
 
         if "inputs" in cfg.add_value_rms_norm_summary:
